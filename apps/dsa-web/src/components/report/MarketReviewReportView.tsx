@@ -1,6 +1,6 @@
 import type React from 'react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { BarChart3, Clipboard, FileText, Gauge, Layers, ShieldAlert, TrendingUp, WalletCards, Workflow } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { BarChart3, Clipboard, FileText, Gauge, Layers, ShieldAlert, TrendingUp, TriangleAlert, WalletCards, Workflow } from 'lucide-react';
 import { historyApi } from '../../api/history';
 import { formatUiText, UI_TEXT } from '../../i18n/uiText';
 import type {
@@ -9,6 +9,7 @@ import type {
   MarketReviewPayloadSection,
   ReportLanguage,
 } from '../../types/analysis';
+import { copyTextToClipboard } from '../../utils/clipboard';
 import { markdownToPlainText } from '../../utils/markdown';
 import { getReportText, normalizeReportLanguage } from '../../utils/reportLanguage';
 import { Card } from '../common';
@@ -27,6 +28,12 @@ interface MarketReviewReportViewProps {
 }
 
 type CopyType = 'markdown' | 'text';
+type CopyStatus = 'copied' | 'failed';
+type CopyFeedback = {
+  type: CopyType;
+  status: CopyStatus;
+  contentKey: string;
+};
 type LoadedMarkdown = {
   recordId: number;
   content: string;
@@ -107,12 +114,18 @@ const getSectionIcon = (title: string): typeof FileText => {
   return FileText;
 };
 
-const splitMarketReviewSections = (markdown: string): MarketReviewSection[] => {
+const splitMarketReviewSections = (
+  markdown: string,
+  fallbackTitles: { fullReview: string; overview: string } = {
+    fullReview: MARKET_REVIEW_TEXT.zh.fullReview,
+    overview: MARKET_REVIEW_TEXT.zh.overview,
+  },
+): MarketReviewSection[] => {
   const matches = Array.from(markdown.matchAll(SECTION_HEADING_PATTERN));
   if (matches.length === 0) {
     return [{
       id: 'full-review',
-      title: '复盘正文',
+      title: fallbackTitles.fullReview,
       content: markdown,
       icon: FileText,
     }];
@@ -122,7 +135,7 @@ const splitMarketReviewSections = (markdown: string): MarketReviewSection[] => {
   const sections: MarketReviewSection[] = intro
     ? [{
         id: 'overview',
-        title: '复盘概览',
+        title: fallbackTitles.overview,
         content: intro,
         icon: FileText,
       }]
@@ -301,6 +314,8 @@ const formatCatalystDirection = (
 };
 
 const MARKET_REVIEW_TEXT: Record<ReportLanguage, {
+  fullReview: string;
+  overview: string;
   reviewSummary: string;
   noReviewSummary: string;
   noSentimentScore: string;
@@ -339,6 +354,8 @@ const MARKET_REVIEW_TEXT: Record<ReportLanguage, {
   notDigestedLabel: string;
 }> = {
   zh: {
+    fullReview: '复盘正文',
+    overview: '复盘概览',
     reviewSummary: '复盘摘要',
     noReviewSummary: '暂无摘要',
     noSentimentScore: '暂无评分',
@@ -376,6 +393,8 @@ const MARKET_REVIEW_TEXT: Record<ReportLanguage, {
     notDigestedLabel: '未消化',
   },
   en: {
+    fullReview: 'Review Body',
+    overview: 'Review Overview',
     reviewSummary: 'Review Summary',
     noReviewSummary: 'No review summary yet',
     noSentimentScore: 'No score yet',
@@ -413,6 +432,8 @@ const MARKET_REVIEW_TEXT: Record<ReportLanguage, {
     notDigestedLabel: 'Not digested',
   },
   ko: {
+    fullReview: '리뷰 본문',
+    overview: '리뷰 개요',
     reviewSummary: '리뷰 요약',
     noReviewSummary: '요약 없음',
     noSentimentScore: '점수 없음',
@@ -475,7 +496,10 @@ export const MarketReviewReportView: React.FC<MarketReviewReportViewProps> = ({
   const marketReviewText = MARKET_REVIEW_TEXT[normalizedReportLanguage];
   const [loadedMarkdown, setLoadedMarkdown] = useState<LoadedMarkdown | null>(null);
   const [loadError, setLoadError] = useState<LoadError | null>(null);
-  const [copiedType, setCopiedType] = useState<CopyType | null>(null);
+  const [copyFeedback, setCopyFeedback] = useState<CopyFeedback | null>(null);
+  const mountedRef = useRef(true);
+  const copyTokenRef = useRef(0);
+  const copyResetTimerRef = useRef<number | null>(null);
   const summary = report?.summary;
   const meta = report?.meta;
   const contextPayload = report?.details?.contextSnapshot?.marketReviewPayload;
@@ -493,9 +517,11 @@ export const MarketReviewReportView: React.FC<MarketReviewReportViewProps> = ({
   const sections = useMemo(
     () => {
       const payloadSections = getPayloadSections(marketReviewPayload);
-      return payloadSections.length > 0 ? payloadSections : splitMarketReviewSections(structuredContent);
+      return payloadSections.length > 0
+        ? payloadSections
+        : splitMarketReviewSections(structuredContent, marketReviewText);
     },
-    [marketReviewPayload, structuredContent],
+    [marketReviewPayload, marketReviewText, structuredContent],
   );
   const structuredMarketData = useMemo(
     () => getStructuredMarketData(marketReviewPayload),
@@ -532,19 +558,100 @@ export const MarketReviewReportView: React.FC<MarketReviewReportViewProps> = ({
     };
   }, [hasStructuredContent, providedContent, recordId, text.loadReportFailed]);
 
+  const contentKey = `${recordId ?? ''}\u0000${content}`;
+  const [prevContentKey, setPrevContentKey] = useState(contentKey);
+  if (prevContentKey !== contentKey) {
+    setPrevContentKey(contentKey);
+    setCopyFeedback(null);
+  }
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      copyTokenRef.current += 1;
+      if (copyResetTimerRef.current !== null) {
+        window.clearTimeout(copyResetTimerRef.current);
+        copyResetTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    copyTokenRef.current += 1;
+    if (copyResetTimerRef.current !== null) {
+      window.clearTimeout(copyResetTimerRef.current);
+      copyResetTimerRef.current = null;
+    }
+  }, [contentKey]);
+
   const handleCopy = useCallback(async (type: CopyType) => {
     if (!content) {
       return;
     }
+    const token = ++copyTokenRef.current;
+    if (copyResetTimerRef.current !== null) {
+      window.clearTimeout(copyResetTimerRef.current);
+      copyResetTimerRef.current = null;
+    }
+    setCopyFeedback(null);
+
+    const isAttemptCurrent = () =>
+      mountedRef.current && copyTokenRef.current === token;
+
+    let ok = false;
     try {
       const value = type === 'markdown' ? content : markdownToPlainText(content);
-      await navigator.clipboard.writeText(value);
-      setCopiedType(type);
-      window.setTimeout(() => setCopiedType(null), 2000);
+      ok = await copyTextToClipboard(value, {
+        shouldFallback: isAttemptCurrent,
+      });
+      if (!ok && isAttemptCurrent()) {
+        console.error('Copy failed: clipboard unavailable');
+      }
     } catch (err) {
-      console.error('Copy failed:', err);
+      if (isAttemptCurrent()) {
+        console.error('Copy failed:', err);
+      }
+      ok = false;
     }
-  }, [content]);
+
+    if (!isAttemptCurrent()) {
+      return;
+    }
+
+    setCopyFeedback({
+      type,
+      status: ok ? 'copied' : 'failed',
+      contentKey,
+    });
+
+    copyResetTimerRef.current = window.setTimeout(() => {
+      copyResetTimerRef.current = null;
+      if (!mountedRef.current || copyTokenRef.current !== token) {
+        return;
+      }
+      setCopyFeedback(null);
+    }, 2000);
+  }, [content, contentKey]);
+
+  const activeCopyFeedback =
+    copyFeedback && copyFeedback.contentKey === contentKey ? copyFeedback : null;
+  const markdownCopyStatus =
+    activeCopyFeedback?.type === 'markdown' ? activeCopyFeedback.status : 'idle';
+  const plainTextCopyStatus =
+    activeCopyFeedback?.type === 'text' ? activeCopyFeedback.status : 'idle';
+  const markdownButtonLabel =
+    markdownCopyStatus === 'copied'
+      ? text.copied
+      : markdownCopyStatus === 'failed'
+        ? text.copyFailed
+        : text.copyMarkdownSource;
+  const plainTextButtonLabel =
+    plainTextCopyStatus === 'copied'
+      ? text.copied
+      : plainTextCopyStatus === 'failed'
+        ? text.copyFailed
+        : text.copyPlainText;
 
   const insightCards = useMemo(() => [
     {
@@ -611,38 +718,50 @@ export const MarketReviewReportView: React.FC<MarketReviewReportViewProps> = ({
                 </span>
               </Tooltip>
             ) : null}
-            <Tooltip content={text.copyMarkdownSource}>
+            <Tooltip content={markdownButtonLabel}>
               <span className="inline-flex">
                 <button
                   type="button"
                   onClick={() => void handleCopy('markdown')}
-                  disabled={isLoading || !content || copiedType !== null}
-                  className="home-surface-button flex h-10 w-10 items-center justify-center rounded-lg text-secondary-text hover:text-foreground disabled:opacity-50"
-                  aria-label={text.copyMarkdownSource}
+                  disabled={isLoading || !content}
+                  className={`home-surface-button flex h-10 w-10 items-center justify-center rounded-lg disabled:opacity-50 ${
+                    markdownCopyStatus === 'failed'
+                      ? 'text-danger hover:text-danger'
+                      : 'text-secondary-text hover:text-foreground'
+                  }`}
+                  aria-label={markdownButtonLabel}
                 >
-                  {copiedType === 'markdown' ? (
+                  {markdownCopyStatus === 'copied' ? (
                     <svg className="h-5 w-5 text-success" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
                     </svg>
+                  ) : markdownCopyStatus === 'failed' ? (
+                    <TriangleAlert className="h-5 w-5 text-danger" aria-hidden="true" />
                   ) : (
                     <Clipboard className="h-5 w-5" aria-hidden="true" />
                   )}
                 </button>
               </span>
             </Tooltip>
-            <Tooltip content={text.copyPlainText}>
+            <Tooltip content={plainTextButtonLabel}>
               <span className="inline-flex">
                 <button
                   type="button"
                   onClick={() => void handleCopy('text')}
-                  disabled={isLoading || !content || copiedType !== null}
-                  className="home-surface-button flex h-10 w-10 items-center justify-center rounded-lg text-secondary-text hover:text-foreground disabled:opacity-50"
-                  aria-label={text.copyPlainText}
+                  disabled={isLoading || !content}
+                  className={`home-surface-button flex h-10 w-10 items-center justify-center rounded-lg disabled:opacity-50 ${
+                    plainTextCopyStatus === 'failed'
+                      ? 'text-danger hover:text-danger'
+                      : 'text-secondary-text hover:text-foreground'
+                  }`}
+                  aria-label={plainTextButtonLabel}
                 >
-                  {copiedType === 'text' ? (
+                  {plainTextCopyStatus === 'copied' ? (
                     <svg className="h-5 w-5 text-success" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
                     </svg>
+                  ) : plainTextCopyStatus === 'failed' ? (
+                    <TriangleAlert className="h-5 w-5 text-danger" aria-hidden="true" />
                   ) : (
                     <FileText className="h-5 w-5" aria-hidden="true" />
                   )}
